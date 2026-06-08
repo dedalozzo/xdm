@@ -11,5 +11,9 @@ venv/
 # (Default lives at ~/.x-dm-chrome-profile, but guard against a local --profile-dir.)
 .x-dm-chrome-profile/
 
+# IDEs
+.idea/
+.vscode/
+
 # macOS
 .DS_Store

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-send_x_dm.py — Send a Direct Message on X (Twitter) from the command line.
+xdm.py — Send a Direct Message on X (Twitter) from the command line.
 
 It drives a real Chrome browser (via Playwright) using a dedicated, persistent
 login profile, so you log in to X *once* and from then on send DMs straight from
@@ -9,18 +9,18 @@ the terminal without touching the browser yourself.
 Quick start
 -----------
     # 1) one-time: open Chrome and log in to X (saves the session)
-    python send_x_dm.py --login
+    python xdm.py --login
 
     # 2) send a DM — message first, then the profile link/@handle
-    python send_x_dm.py "こんにちは！ 👋" https://x.com/jack
-    python send_x_dm.py -m "Hello there" -t @jack
+    python xdm.py "こんにちは！ 👋" https://x.com/jack
+    python xdm.py -m "Hello there" -t @jack
 
     # message from a file or stdin (handy for long / multi-line text)
-    python send_x_dm.py -f message.txt -t jack
-    echo "hi" | python send_x_dm.py --stdin -t jack -y
+    python xdm.py -f message.txt -t jack
+    echo "hi" | python xdm.py --stdin -t jack -y
 
     # compose but DON'T actually send, to check it works
-    python send_x_dm.py "test" @jack --dry-run
+    python xdm.py "test" @jack --dry-run
 
 Notes
 -----
@@ -66,7 +66,7 @@ def import_playwright():
             "Set it up once:\n"
             "    python3 -m venv .venv\n"
             "    .venv/bin/python -m pip install --upgrade pip playwright\n"
-            "then run with  .venv/bin/python send_x_dm.py ..."
+            "then run with  .venv/bin/python xdm.py ..."
         )
         sys.exit(3)
 
@@ -164,7 +164,7 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run):
 
             if not is_logged_in(page):
                 raise SystemExit(
-                    "Not logged in to X. Run:  send_x_dm.py --login"
+                    "Not logged in to X. Run:  xdm.py --login"
                 )
 
             # Open the DM composer from the profile.
@@ -214,16 +214,16 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="send_x_dm.py",
+        prog="xdm.py",
         description="Send a Direct Message on X (Twitter) from the command line via Chrome.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
             examples:
-              send_x_dm.py --login
-              send_x_dm.py "こんにちは 👋" https://x.com/jack
-              send_x_dm.py -m "hi" -t @jack
-              send_x_dm.py -f note.txt -t jack --dry-run
+              xdm.py --login
+              xdm.py "こんにちは 👋" https://x.com/jack
+              xdm.py -m "hi" -t @jack
+              xdm.py -f note.txt -t jack --dry-run
             """
         ),
     )

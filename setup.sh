@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-time setup for send_x_dm.py.
+# One-time setup for xdm.py.
 # Creates a local virtualenv and installs Playwright. Run:  bash setup.sh
 set -e
 cd "$(dirname "$0")"
@@ -13,5 +13,5 @@ echo "Installing Playwright ..."
 
 echo
 echo "Done. Next steps:"
-echo "  .venv/bin/python send_x_dm.py --login          # log in once"
-echo '  .venv/bin/python send_x_dm.py "message" @handle  # send a DM'
+echo "  .venv/bin/python xdm.py --login          # log in once"
+echo '  .venv/bin/python xdm.py "message" @handle  # send a DM'
