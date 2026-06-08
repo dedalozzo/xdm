@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# Saved Chrome login profile — contains session cookies, never commit it.
+# (Default lives at ~/.x-dm-chrome-profile, but guard against a local --profile-dir.)
+.x-dm-chrome-profile/
+
+# macOS
+.DS_Store
