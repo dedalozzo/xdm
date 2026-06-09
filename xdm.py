@@ -15,6 +15,9 @@ Quick start
     python xdm.py "こんにちは！ 👋" https://x.com/jack
     python xdm.py -m "Hello there" -t @jack
 
+    # follow the profile first, then send
+    python xdm.py --follow "Thanks!" @jack
+
     # message from a file or stdin (handy for long / multi-line text)
     python xdm.py -f message.txt -t jack
     echo "hi" | python xdm.py --stdin -t jack -y
@@ -49,6 +52,11 @@ SEL_LOGGED_IN = (
     '[data-testid="SideNav_AccountSwitcher_Button"], '
     '[data-testid="AppTabBar_Home_Link"]'
 )
+# Follow / Unfollow buttons embed the profile's numeric id, e.g.
+# data-testid="1234567890-follow". Match by suffix and scope to the main
+# column so we never touch "Who to follow" suggestions in the sidebar.
+SEL_FOLLOW = '[data-testid="primaryColumn"] [data-testid$="-follow"]'
+SEL_UNFOLLOW = '[data-testid="primaryColumn"] [data-testid$="-unfollow"]'
 
 
 def eprint(*a, **k):
@@ -124,6 +132,28 @@ def is_logged_in(page, timeout=8000):
         return False
 
 
+def follow_profile(page, handle, ms):
+    """Follow the profile unless already following (then it's a no-op)."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    # Wait for either the Follow or the Unfollow (already-following) button.
+    try:
+        page.wait_for_selector(f"{SEL_FOLLOW}, {SEL_UNFOLLOW}", timeout=ms)
+    except PWTimeout:
+        raise SystemExit(f"Couldn't find a Follow button on @{handle}'s profile.")
+
+    if page.query_selector(SEL_UNFOLLOW):
+        print(f"Already following @{handle}.")
+        return
+
+    page.click(SEL_FOLLOW, timeout=ms)
+    try:
+        page.wait_for_selector(SEL_UNFOLLOW, timeout=ms)
+        print(f"✓ Followed @{handle}.")
+    except PWTimeout:
+        print(f"Clicked Follow on @{handle} (couldn't confirm the new state).")
+
+
 def cmd_login(profile_dir):
     sync_playwright = import_playwright()
     with sync_playwright() as pw:
@@ -150,7 +180,7 @@ def cmd_login(profile_dir):
             )
 
 
-def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run):
+def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run, follow):
     sync_playwright = import_playwright()
     from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -166,6 +196,13 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run):
                 raise SystemExit(
                     "Not logged in to X. Run:  xdm.py --login"
                 )
+
+            # Optionally follow the profile before messaging.
+            if follow:
+                if dry_run:
+                    print(f"DRY RUN — would follow @{handle} first (not following).")
+                else:
+                    follow_profile(page, handle, ms)
 
             # Open the DM composer from the profile.
             try:
@@ -223,6 +260,7 @@ def main():
               xdm.py --login
               xdm.py "こんにちは 👋" https://x.com/jack
               xdm.py -m "hi" -t @jack
+              xdm.py --follow "hi" @jack
               xdm.py -f note.txt -t jack --dry-run
             """
         ),
@@ -237,6 +275,8 @@ def main():
     ap.add_argument("--stdin", action="store_true", help="read the message from stdin")
     ap.add_argument("--login", action="store_true",
                     help="open Chrome to log in once; saves the session and exits")
+    ap.add_argument("--follow", action="store_true",
+                    help="follow the profile before sending (no-op if already following)")
     ap.add_argument("--headless", action="store_true",
                     help="run with no visible window (can be flagged more by X)")
     ap.add_argument("--dry-run", action="store_true",
@@ -271,6 +311,8 @@ def main():
         if not sys.stdin.isatty():
             eprint("Refusing to send without confirmation in a non-interactive shell. Add -y to send.")
             sys.exit(2)
+        if args.follow:
+            print(f"Action:  follow @{handle}, then send the DM below")
         print(f"To:      @{handle}  ({url})")
         print("Message:")
         print(textwrap.indent(message, "    "))
@@ -282,7 +324,8 @@ def main():
             print("Aborted.")
             return
 
-    cmd_send(profile_dir, url, handle, message, args.headless, args.timeout, args.dry_run)
+    cmd_send(profile_dir, url, handle, message, args.headless, args.timeout,
+             args.dry_run, args.follow)
 
 
 if __name__ == "__main__":

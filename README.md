@@ -30,6 +30,9 @@ Chromium. (Fallback if Chrome ever misbehaves:
 .venv/bin/python xdm.py "こんにちは！ 👋" https://x.com/jack
 .venv/bin/python xdm.py -m "Hello there" -t @jack
 
+# follow the profile first, then DM
+.venv/bin/python xdm.py --follow "Thanks for the follow!" @jack
+
 # long / multi-line message from a file or stdin
 .venv/bin/python xdm.py -f message.txt -t jack
 echo "hi" | .venv/bin/python xdm.py --stdin -t jack -y
@@ -46,6 +49,7 @@ echo "hi" | .venv/bin/python xdm.py --stdin -t jack -y
 | `-m, --message` / `-t, --to` | same as positionals, named |
 | `-f, --message-file` / `--stdin` | read message from a file / stdin |
 | `--login` | open Chrome to log in once, then exit |
+| `--follow` | follow the profile before sending (no-op if already following) |
 | `--dry-run` | compose but don't click Send |
 | `-y, --yes` | skip the confirmation prompt (needed when scripting / piping) |
 | `--headless` | no visible window (X may flag this more — headed is the default) |
