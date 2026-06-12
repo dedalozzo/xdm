@@ -37,6 +37,7 @@ Notes
 """
 
 import argparse
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -46,8 +47,21 @@ DEFAULT_PROFILE_DIR = Path.home() / ".x-dm-chrome-profile"
 
 # X is fairly stable on these data-testid hooks.
 SEL_DM_BUTTON = '[data-testid="sendDMFromProfile"]'
-SEL_DM_INPUT = '[data-testid="dmComposerTextInput"]'
-SEL_DM_SEND = '[data-testid="dmComposerSendButton"]'
+# X's redesigned "Chat" UI uses a real <textarea> plus a send button (an
+# up-arrow that appears once the box has text). The old Draft.js contenteditable
+# (dmComposerTextInput) and its send button (dmComposerSendButton) differ, so
+# match both forms to keep working on either UI.
+SEL_DM_INPUT = (
+    '[data-testid="dm-composer-textarea"], '
+    '[data-testid="dmComposerTextInput"]'
+)
+SEL_DM_SEND = (
+    '[data-testid="dm-composer-send-button"], '
+    '[data-testid="dmComposerSendButton"]'
+)
+# Encrypted-chat ("Chat") passcode/PIN lock screen: a row of numeric <input>
+# boxes inside this container.
+SEL_PIN_CONTAINER = '[data-testid="pin-code-input-container"]'
 SEL_LOGGED_IN = (
     '[data-testid="SideNav_AccountSwitcher_Button"], '
     '[data-testid="AppTabBar_Home_Link"]'
@@ -57,6 +71,13 @@ SEL_LOGGED_IN = (
 # column so we never touch "Who to follow" suggestions in the sidebar.
 SEL_FOLLOW = '[data-testid="primaryColumn"] [data-testid$="-follow"]'
 SEL_UNFOLLOW = '[data-testid="primaryColumn"] [data-testid$="-unfollow"]'
+# A profile we've blocked shows an "Unblock" button in place of Follow/Message
+# (same numeric-id suffix pattern).
+SEL_UNBLOCK = '[data-testid="primaryColumn"] [data-testid$="-unblock"]'
+# A suspended / nonexistent account renders an empty-state header instead of a
+# profile ("Account suspended", "This account doesn't exist", …) with no action
+# buttons at all — so there's no Message button. Detect it and say why.
+SEL_EMPTY_STATE = '[data-testid="empty_state_header_text"]'
 
 
 def eprint(*a, **k):
@@ -154,6 +175,26 @@ def follow_profile(page, handle, ms):
         print(f"Clicked Follow on @{handle} (couldn't confirm the new state).")
 
 
+def enter_chat_passcode(page, passcode, ms):
+    """Type X's encrypted-chat passcode into the PIN lock screen (a row of
+    numeric boxes) and wait for it to clear."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    boxes = page.query_selector_all(f"{SEL_PIN_CONTAINER} input")
+    target = boxes[0] if boxes else page.query_selector(SEL_PIN_CONTAINER)
+    target.click()
+    page.keyboard.type(passcode, delay=80)   # OTP boxes auto-advance per digit
+    page.keyboard.press("Enter")             # usually auto-submits; nudge anyway
+    try:
+        page.wait_for_selector(SEL_PIN_CONTAINER, state="detached", timeout=ms)
+        print("✓ Unlocked encrypted chat.")
+    except PWTimeout:
+        raise SystemExit(
+            "Entered the chat passcode but the lock screen didn't clear — "
+            "is the passcode correct?"
+        )
+
+
 def cmd_login(profile_dir):
     sync_playwright = import_playwright()
     with sync_playwright() as pw:
@@ -180,7 +221,8 @@ def cmd_login(profile_dir):
             )
 
 
-def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run, follow):
+def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
+             follow, passcode, settle):
     sync_playwright = import_playwright()
     from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -197,6 +239,26 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run, fo
                     "Not logged in to X. Run:  xdm.py --login"
                 )
 
+            # Fast-fail if we've blocked them: a blocked profile shows "Unblock"
+            # instead of Follow/Message, so the Message button never appears and
+            # we'd otherwise wait out the whole timeout. The header's action
+            # button renders right away, so wait only until one shows, then check.
+            try:
+                page.wait_for_selector(
+                    f"{SEL_DM_BUTTON}, {SEL_FOLLOW}, {SEL_UNFOLLOW}, {SEL_UNBLOCK}, "
+                    f"{SEL_EMPTY_STATE}",
+                    timeout=ms,
+                )
+            except PWTimeout:
+                pass
+            # Suspended or nonexistent account: no profile, hence no Message button.
+            empty = page.query_selector(SEL_EMPTY_STATE)
+            if empty:
+                reason = " ".join((empty.inner_text() or "").split()) or "account unavailable"
+                raise SystemExit(f"@{handle}: {reason} — nothing to message. Skipping.")
+            if page.query_selector(SEL_UNBLOCK):
+                raise SystemExit(f"@{handle} is blocked — skipping.")
+
             # Optionally follow the profile before messaging.
             if follow:
                 if dry_run:
@@ -204,18 +266,48 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run, fo
                 else:
                     follow_profile(page, handle, ms)
 
-            # Open the DM composer from the profile.
+            # Open the DM composer from the profile. The header already rendered
+            # during the block check above, so a present Message button clicks at
+            # once; cap the wait low so profiles that don't accept our DMs (closed
+            # DMs, or verified-senders-only) fail in seconds, not the full timeout.
             try:
-                page.click(SEL_DM_BUTTON, timeout=ms)
+                page.click(SEL_DM_BUTTON, timeout=min(ms, 10000))
             except PWTimeout:
                 raise SystemExit(
-                    f"No “Message” button on @{handle}'s profile.\n"
-                    "X only shows it when they accept DMs from you (open DMs, or "
-                    "you follow each other) — so there's nothing to click."
+                    f"No usable Message button on @{handle}'s profile — they "
+                    "don't accept DMs from you (DMs closed, or verified-senders-"
+                    "only, which would need Premium). Skipping."
                 )
 
+            # After opening the chat, X may show the encrypted-chat passcode
+            # lock screen before the composer. Wait for whichever shows first.
+            try:
+                page.wait_for_selector(
+                    f"{SEL_DM_INPUT}, {SEL_PIN_CONTAINER}", timeout=ms
+                )
+            except PWTimeout:
+                raise SystemExit(
+                    f"Couldn't find the message box for @{handle}. X may be "
+                    "throttling, or have changed the composer again."
+                )
+
+            if page.query_selector(SEL_PIN_CONTAINER):
+                if not passcode:
+                    raise SystemExit(
+                        "X is asking for the encrypted-chat passcode. Re-run "
+                        "with --passcode <code> or set XDM_CHAT_PASSCODE."
+                    )
+                enter_chat_passcode(page, passcode, ms)
+
             # Type the message, preserving newlines and Unicode/emoji.
-            page.wait_for_selector(SEL_DM_INPUT, timeout=ms).click()
+            try:
+                composer = page.wait_for_selector(SEL_DM_INPUT, timeout=ms)
+            except PWTimeout:
+                raise SystemExit(
+                    f"Couldn't find the message box for @{handle} (after any "
+                    "passcode). X may be throttling or have changed the composer."
+                )
+            composer.click()
             for i, line in enumerate(message.split("\n")):
                 if i:
                     page.keyboard.press("Shift+Enter")  # newline without sending
@@ -231,18 +323,50 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run, fo
                         pass
                 return
 
-            page.click(SEL_DM_SEND, timeout=ms)
+            # Confirm a send by a genuinely NEW bubble that STILL EXISTS after a
+            # settle. Neither weaker signal is proof: the textarea clears
+            # optimistically the instant you click send, and an optimistic bubble
+            # can flash up then vanish if the send never commits (e.g. the browser
+            # closing mid-send). We snapshot existing bubble ids so late-loading
+            # history isn't mistaken for our message either.
+            new_bubble = (
+                "(ids)=>[...document.querySelectorAll("
+                "'[data-testid^=\"message-\"]')]"
+                ".some(e=>!ids.includes(e.getAttribute('data-testid')))"
+            )
+            before_ids = [
+                el.get_attribute("data-testid")
+                for el in page.query_selector_all('[data-testid^="message-"]')
+            ]
 
-            # Best-effort confirmation: the input clears once the DM is sent.
+            # Click the send button — the up-arrow that appears once the box has
+            # text. Fall back to Enter if it's not present (e.g. the old UI).
+            try:
+                page.click(SEL_DM_SEND, timeout=min(ms, 10000))
+            except PWTimeout:
+                page.keyboard.press("Enter")
+
+            # A new bubble must appear...
             try:
                 page.wait_for_function(
-                    "(s)=>{const e=document.querySelector(s);"
-                    "return !!e && e.innerText.trim()==='';}",
-                    SEL_DM_INPUT,
-                    timeout=ms,
+                    new_bubble, arg=before_ids, timeout=min(ms, 15000)
                 )
             except PWTimeout:
-                pass
+                raise SystemExit(
+                    f"Send to @{handle} didn't go through — no message appeared "
+                    "in the thread. NOT marking as sent."
+                )
+
+            # ...and survive the send committing. Closing the browser too soon
+            # can abort the in-flight send, so the message posts optimistically
+            # then never lands — keep the window open `settle` seconds, then
+            # confirm the bubble is still there before we tear down.
+            page.wait_for_timeout(int(settle * 1000))
+            if not page.evaluate(new_bubble, before_ids):
+                raise SystemExit(
+                    f"Send to @{handle} didn't stick — the message bubble "
+                    "vanished, so it wasn't delivered. NOT marking as sent."
+                )
 
             print(f"✓ Sent to @{handle}.")
         finally:
@@ -277,6 +401,9 @@ def main():
                     help="open Chrome to log in once; saves the session and exits")
     ap.add_argument("--follow", action="store_true",
                     help="follow the profile before sending (no-op if already following)")
+    ap.add_argument("--passcode", default=os.environ.get("XDM_CHAT_PASSCODE"),
+                    help="encrypted-chat passcode for X's DM lock screen "
+                         "(or set XDM_CHAT_PASSCODE)")
     ap.add_argument("--headless", action="store_true",
                     help="run with no visible window (can be flagged more by X)")
     ap.add_argument("--dry-run", action="store_true",
@@ -285,6 +412,10 @@ def main():
                     help="skip the confirmation prompt")
     ap.add_argument("--timeout", type=float, default=45.0,
                     help="per-step timeout in seconds (default 45)")
+    ap.add_argument("--settle", type=float, default=5.0,
+                    help="seconds to keep the browser open after a send so it "
+                         "fully commits before closing (default 5; try 10 if a "
+                         "message ever posts but doesn't land)")
     ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE_DIR),
                     help=f"Chrome profile dir for the saved login (default {DEFAULT_PROFILE_DIR})")
     args = ap.parse_args()
@@ -324,8 +455,9 @@ def main():
             print("Aborted.")
             return
 
+    passcode = (args.passcode or "").strip() or None
     cmd_send(profile_dir, url, handle, message, args.headless, args.timeout,
-             args.dry_run, args.follow)
+             args.dry_run, args.follow, passcode, args.settle)
 
 
 if __name__ == "__main__":
