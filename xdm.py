@@ -428,22 +428,31 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                 ".some(e=>!ids.includes(e.getAttribute('data-testid'))"
                 "&&norm(e.innerText).includes(norm(needle)));}"
             )
-            # Short status snippets X attaches to a bubble whose send failed.
-            # A failed bubble PERSISTS in the thread, so persistence alone is
-            # not proof of delivery — these markers veto it.
-            fail_markers = (
-                "()=>{const root=document.querySelector('main')||document.body;"
-                "return [...root.querySelectorAll('span,div')]"
-                ".map(e=>(e.innerText||'').trim())"
-                ".filter(t=>t&&t.length<80&&"
-                "/\\b(failed to send|not delivered|couldn.t send|message failed)"
-                "\\b/i.test(t));}"
+            # X rejects a send (duplicate text, daily rate limit, throttling)
+            # by leaving the bubble in place but tagging it with a small status
+            # badge — observed verbatim as "Failed, Try Again". The bubble (and
+            # its text) still shows, so text presence is NOT proof of delivery.
+            # Count those badges in the message list, EXCLUDING message bodies
+            # (so a message that merely contains the word "failed" can't
+            # false-trigger); a rise in the count after our send = it failed.
+            fail_badge_count = (
+                "()=>{const FAIL=/failed,?\\s*try ?again|(^|\\s)failed\\b|not sent"
+                "|not delivered|undelivered|tap to retry|(^|\\s)try again\\b|resend"
+                "|couldn.?t send|unable to send/i;"
+                "const p=document.querySelector('[data-testid=\"dm-message-list\"]')"
+                "||document.querySelector('[data-testid=\"dm-conversation-panel\"]')"
+                "||document.querySelector('main')||document.body;let n=0;"
+                "p.querySelectorAll('span,div,button,[role=\"button\"]').forEach(e=>{"
+                "if(e.closest('[data-testid^=\"message-text\"]'))return;"
+                "const t=(e.innerText||e.getAttribute('aria-label')||'')"
+                ".trim().replace(/\\s+/g,' ');"
+                "if(t&&t.length<=30&&FAIL.test(t))n++;});return n;}"
             )
             before_ids = [
                 el.get_attribute("data-testid")
                 for el in page.query_selector_all('[data-testid^="message-"]')
             ]
-            marks_before = page.evaluate(fail_markers)
+            fails_before = page.evaluate(fail_badge_count)
 
             # The server's verdict on the send call — the one signal an
             # optimistic UI can't fake. Captured from the network while the
@@ -512,15 +521,20 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                     f"(HTTP {rejected[-1]}). NOT marking as sent."
                 )
 
-            # Bubble flagged "Failed to send" / "Not delivered" -> not sent.
-            new_marks = [
-                m for m in page.evaluate(fail_markers) if m not in marks_before
-            ]
-            if new_marks:
-                raise SystemExit(
-                    f"Send to @{handle} FAILED — the thread shows "
-                    f"{new_marks[0]!r}. NOT marking as sent."
-                )
+            # Bubble tagged "Failed, Try Again" (duplicate text / daily rate
+            # limit / throttling) -> not delivered. X can take a few seconds to
+            # flip a bubble from "sending" to "Failed", so poll past the settle
+            # rather than checking once. A rise over the pre-send count is our
+            # send failing (ignores any pre-existing failed bubble in the thread).
+            for i in range(4):
+                if page.evaluate(fail_badge_count) > fails_before:
+                    raise SystemExit(
+                        f"Send to @{handle} FAILED — X marked the message "
+                        '"Failed, Try Again" (duplicate text, or you\'ve hit the '
+                        "daily message limit). NOT marking as sent."
+                    )
+                if i < 3:
+                    page.wait_for_timeout(1500)
 
             # The verified wall can also pop AFTER an optimistic bubble shows;
             # if it's up now, nothing was delivered regardless of the bubble.
