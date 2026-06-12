@@ -38,6 +38,7 @@ Notes
 
 import argparse
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -78,6 +79,13 @@ SEL_UNBLOCK = '[data-testid="primaryColumn"] [data-testid$="-unblock"]'
 # profile ("Account suspended", "This account doesn't exist", …) with no action
 # buttons at all — so there's no Message button. Detect it and say why.
 SEL_EMPTY_STATE = '[data-testid="empty_state_header_text"]'
+# Toasts / alert banners / modal sheets — where X explains itself when a chat
+# can't be opened (e.g. recipient accepts DMs from verified senders only) or a
+# send fails. Read-only; never clicked.
+SEL_NOTICE = (
+    '[data-testid="toast"], [role="alert"], [role="alertdialog"], '
+    '[data-testid="confirmationSheetDialog"], [role="dialog"]'
+)
 
 
 def eprint(*a, **k):
@@ -175,6 +183,23 @@ def follow_profile(page, handle, ms):
         print(f"Clicked Follow on @{handle} (couldn't confirm the new state).")
 
 
+def page_notices(page):
+    """Visible toast/banner/dialog texts — X's own words for what's wrong."""
+    try:
+        texts = page.eval_on_selector_all(
+            SEL_NOTICE,
+            "els => els.map(e => (e.innerText || '').trim().replace(/\\s+/g, ' '))"
+            ".filter(t => t && t.length < 300)",
+        )
+    except Exception:
+        return ""
+    seen = []
+    for t in texts:
+        if t not in seen:
+            seen.append(t)
+    return " | ".join(seen)
+
+
 def enter_chat_passcode(page, passcode, ms):
     """Type X's encrypted-chat passcode into the PIN lock screen (a row of
     numeric boxes) and wait for it to clear."""
@@ -182,6 +207,11 @@ def enter_chat_passcode(page, passcode, ms):
 
     boxes = page.query_selector_all(f"{SEL_PIN_CONTAINER} input")
     target = boxes[0] if boxes else page.query_selector(SEL_PIN_CONTAINER)
+    if target is None:
+        raise SystemExit(
+            "Chat passcode screen detected but its input vanished — X may have "
+            "changed the lock screen. Not sent."
+        )
     target.click()
     page.keyboard.type(passcode, delay=80)   # OTP boxes auto-advance per digit
     page.keyboard.press("Enter")             # usually auto-submits; nudge anyway
@@ -224,6 +254,7 @@ def cmd_login(profile_dir):
 def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
              follow, passcode, settle):
     sync_playwright = import_playwright()
+    from playwright.sync_api import Error as PWError
     from playwright.sync_api import TimeoutError as PWTimeout
 
     ms = int(timeout_s * 1000)
@@ -273,10 +304,12 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
             try:
                 page.click(SEL_DM_BUTTON, timeout=min(ms, 10000))
             except PWTimeout:
+                notes = page_notices(page)
                 raise SystemExit(
-                    f"No usable Message button on @{handle}'s profile — they "
-                    "don't accept DMs from you (DMs closed, or verified-senders-"
-                    "only, which would need Premium). Skipping."
+                    f"Can't DM @{handle}: no usable Message button on their "
+                    "profile — they don't accept DMs from you (DMs closed, or "
+                    "verified-senders-only, which would need Premium). Skipping."
+                    + (f"\nX says: {notes}" if notes else "")
                 )
 
             # After opening the chat, X may show the encrypted-chat passcode
@@ -286,9 +319,21 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                     f"{SEL_DM_INPUT}, {SEL_PIN_CONTAINER}", timeout=ms
                 )
             except PWTimeout:
+                # No composer ever showed. If X put up a notice (the verified-
+                # senders-only upsell, "you can't message this account", …),
+                # report X's own words instead of a generic failure.
+                notes = page_notices(page)
+                if re.search(r"verif|premium|can.?t .{0,20}messag|not accept",
+                              notes, re.I):
+                    raise SystemExit(
+                        f"Can't DM @{handle} — X says: {notes}\n"
+                        "(Most likely they accept DMs from verified senders "
+                        "only and this account isn't verified.) Skipping."
+                    )
                 raise SystemExit(
-                    f"Couldn't find the message box for @{handle}. X may be "
-                    "throttling, or have changed the composer again."
+                    f"Couldn't find the message box for @{handle}."
+                    + (f" X says: {notes}" if notes else
+                       " X may be throttling, or have changed the composer again.")
                 )
 
             if page.query_selector(SEL_PIN_CONTAINER):
@@ -303,9 +348,12 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
             try:
                 composer = page.wait_for_selector(SEL_DM_INPUT, timeout=ms)
             except PWTimeout:
+                notes = page_notices(page)
                 raise SystemExit(
                     f"Couldn't find the message box for @{handle} (after any "
-                    "passcode). X may be throttling or have changed the composer."
+                    "passcode)."
+                    + (f" X says: {notes}" if notes else
+                       " X may be throttling or have changed the composer.")
                 )
             composer.click()
             for i, line in enumerate(message.split("\n")):
@@ -334,10 +382,51 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                 "'[data-testid^=\"message-\"]')]"
                 ".some(e=>!ids.includes(e.getAttribute('data-testid')))"
             )
+            # A new bubble whose text actually contains the message we typed —
+            # guards against counting an incoming message or late-loading
+            # history as our own send.
+            bubble_with_text = (
+                "(args)=>{const [ids,needle]=args;"
+                "const norm=s=>(s||'').replace(/\\s+/g,' ').trim();"
+                "return [...document.querySelectorAll("
+                "'[data-testid^=\"message-\"]')]"
+                ".some(e=>!ids.includes(e.getAttribute('data-testid'))"
+                "&&norm(e.innerText).includes(norm(needle)));}"
+            )
+            # Short status snippets X attaches to a bubble whose send failed.
+            # A failed bubble PERSISTS in the thread, so persistence alone is
+            # not proof of delivery — these markers veto it.
+            fail_markers = (
+                "()=>{const root=document.querySelector('main')||document.body;"
+                "return [...root.querySelectorAll('span,div')]"
+                ".map(e=>(e.innerText||'').trim())"
+                ".filter(t=>t&&t.length<80&&"
+                "/\\b(failed to send|not delivered|couldn.t send|message failed)"
+                "\\b/i.test(t));}"
+            )
             before_ids = [
                 el.get_attribute("data-testid")
                 for el in page.query_selector_all('[data-testid^="message-"]')
             ]
+            marks_before = page.evaluate(fail_markers)
+
+            # The server's verdict on the send call — the one signal an
+            # optimistic UI can't fake. Captured from the network while the
+            # DOM does its thing.
+            send_responses = []
+
+            def _track_send(resp):
+                try:
+                    if resp.request.method == "POST" and re.search(
+                        r"/dm/new|/dm/conversation|dm_new|SendMessage"
+                        r"|MessageCreate|/xchat|/chat/",
+                        resp.url, re.I,
+                    ):
+                        send_responses.append((resp.status, resp.url))
+                except Exception:
+                    pass
+
+            page.on("response", _track_send)
 
             # Click the send button — the up-arrow that appears once the box has
             # text. Fall back to Enter if it's not present (e.g. the old UI).
@@ -352,9 +441,11 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                     new_bubble, arg=before_ids, timeout=min(ms, 15000)
                 )
             except PWTimeout:
+                notes = page_notices(page)
                 raise SystemExit(
                     f"Send to @{handle} didn't go through — no message appeared "
-                    "in the thread. NOT marking as sent."
+                    "in the thread." + (f" X says: {notes}" if notes else "")
+                    + " NOT marking as sent."
                 )
 
             # ...and survive the send committing. Closing the browser too soon
@@ -368,9 +459,52 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                     "vanished, so it wasn't delivered. NOT marking as sent."
                 )
 
-            print(f"✓ Sent to @{handle}.")
+            # Server said no -> the persisting bubble is a stuck optimistic one.
+            rejected = [s for s, _u in send_responses if s >= 400]
+            if rejected:
+                raise SystemExit(
+                    f"Send to @{handle} FAILED — X rejected the send "
+                    f"(HTTP {rejected[-1]}). NOT marking as sent."
+                )
+
+            # Bubble flagged "Failed to send" / "Not delivered" -> not sent.
+            new_marks = [
+                m for m in page.evaluate(fail_markers) if m not in marks_before
+            ]
+            if new_marks:
+                raise SystemExit(
+                    f"Send to @{handle} FAILED — the thread shows "
+                    f"{new_marks[0]!r}. NOT marking as sent."
+                )
+
+            # Positive evidence required for exit 0: the server accepted the
+            # send call, or the new bubble verifiably contains our text.
+            ok_http = any(200 <= s < 300 for s, _u in send_responses)
+            text_ok = page.evaluate(bubble_with_text, [before_ids, message])
+            if not ok_http and not text_ok:
+                raise SystemExit(
+                    f"Send to @{handle} UNCONFIRMED — a new bubble appeared but "
+                    "doesn't contain your message, and no send API call was "
+                    "observed. NOT marking as sent."
+                )
+
+            print(f"✓ Sent to @{handle}."
+                  + (" (server confirmed)" if ok_http else ""))
+        except PWError as e:
+            # Any X surface we don't manage yet (upsell dialogs, overlays,
+            # redesigns) lands here: one clean line + X's own notice, not a
+            # traceback, and a nonzero exit.
+            first = (str(e) or repr(e)).splitlines()[0]
+            notes = page_notices(page)
+            raise SystemExit(
+                f"Couldn't send to @{handle}: {first}"
+                + (f"\nX says: {notes}" if notes else "")
+            )
         finally:
-            ctx.close()
+            try:
+                ctx.close()
+            except PWError:
+                pass
 
 
 def main():
