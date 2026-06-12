@@ -183,6 +183,27 @@ def follow_profile(page, handle, ms):
         print(f"Clicked Follow on @{handle} (couldn't confirm the new state).")
 
 
+def verified_wall(page):
+    """Return X's "Get verified to message" upsell text if that modal is up.
+
+    X shows this `[role="dialog"]` ("Only verified users can send Direct Message
+    requests to people that don't follow them") when the recipient accepts DM
+    requests from verified senders only and we aren't verified. It appears a beat
+    AFTER the composer renders and then REMOVES the composer, so the message can
+    never be sent — and no send API call is ever made. Returns '' if not present.
+    """
+    try:
+        return page.evaluate(
+            "()=>{for(const d of document.querySelectorAll("
+            "'[role=\"dialog\"],[role=\"alertdialog\"]')){"
+            "const t=(d.innerText||'').replace(/\\s+/g,' ').trim();"
+            "if(/only verified users can send|get verified to (message|continue)"
+            "|verified to message/i.test(t))return t.slice(0,280);}return '';}"
+        )
+    except Exception:
+        return ""
+
+
 def page_notices(page):
     """Visible toast/banner/dialog texts — X's own words for what's wrong."""
     try:
@@ -313,10 +334,12 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                 )
 
             # After opening the chat, X may show the encrypted-chat passcode
-            # lock screen before the composer. Wait for whichever shows first.
+            # lock screen, the composer, or a blocking dialog. Wait for any.
             try:
                 page.wait_for_selector(
-                    f"{SEL_DM_INPUT}, {SEL_PIN_CONTAINER}", timeout=ms
+                    f"{SEL_DM_INPUT}, {SEL_PIN_CONTAINER}, "
+                    '[role="dialog"], [role="alertdialog"]',
+                    timeout=ms,
                 )
             except PWTimeout:
                 # No composer ever showed. If X put up a notice (the verified-
@@ -334,6 +357,18 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                     f"Couldn't find the message box for @{handle}."
                     + (f" X says: {notes}" if notes else
                        " X may be throttling, or have changed the composer again.")
+                )
+
+            # The "Get verified to message" wall lands a beat after the composer
+            # renders and then removes it — settle briefly so we catch it instead
+            # of typing into a composer that's about to vanish. The DM is
+            # impossible in this case; stop now rather than fake a send.
+            page.wait_for_timeout(800)
+            wall = verified_wall(page)
+            if wall:
+                raise SystemExit(
+                    f"Can't DM @{handle}: X requires a verified (Premium) account "
+                    f"to message them — message NOT sent.\nX says: {wall}"
                 )
 
             if page.query_selector(SEL_PIN_CONTAINER):
@@ -428,6 +463,16 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
 
             page.on("response", _track_send)
 
+            # Last-instant check: if the verified wall raced in after we typed,
+            # the composer is gone and the send is impossible — bail before
+            # clicking anything (and before an optimistic bubble can mislead us).
+            wall = verified_wall(page)
+            if wall:
+                raise SystemExit(
+                    f"Can't DM @{handle}: X requires a verified (Premium) account "
+                    f"to message them — message NOT sent.\nX says: {wall}"
+                )
+
             # Click the send button — the up-arrow that appears once the box has
             # text. Fall back to Enter if it's not present (e.g. the old UI).
             try:
@@ -475,6 +520,15 @@ def cmd_send(profile_dir, url, handle, message, headless, timeout_s, dry_run,
                 raise SystemExit(
                     f"Send to @{handle} FAILED — the thread shows "
                     f"{new_marks[0]!r}. NOT marking as sent."
+                )
+
+            # The verified wall can also pop AFTER an optimistic bubble shows;
+            # if it's up now, nothing was delivered regardless of the bubble.
+            wall = verified_wall(page)
+            if wall:
+                raise SystemExit(
+                    f"Send to @{handle} FAILED — X put up the verified/Premium "
+                    f"wall; the message was not delivered.\nX says: {wall}"
                 )
 
             # Positive evidence required for exit 0: the server accepted the
